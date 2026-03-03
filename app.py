@@ -17,7 +17,17 @@ def resolve():
         return jsonify({"error": "url is required"}), 400
 
     ydl_opts = {
-        "format": f"best[height<={quality}]/bestvideo[height<={quality}]+bestaudio/best",
+        # Prefer direct HTTP/HTTPS downloads over HLS/DASH streams
+        "format": (
+            f"best[height<={quality}][protocol=https]/"
+            f"best[height<={quality}][protocol=http]/"
+            f"best[protocol=https]/"
+            f"best[protocol=http]/"
+            f"best[height<={quality}][protocol!=m3u8_native][protocol!=m3u8]/"
+            f"best[protocol!=m3u8_native][protocol!=m3u8]/"
+            f"best[height<={quality}]/"
+            f"best"
+        ),
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -30,14 +40,19 @@ def resolve():
 
             download_url = info.get("url")
             http_headers = info.get("http_headers", {})
+            protocol = info.get("protocol", "unknown")
 
             if not download_url and info.get("requested_formats"):
                 fmt = info["requested_formats"][0]
                 download_url = fmt.get("url")
                 http_headers = fmt.get("http_headers", http_headers)
+                protocol = fmt.get("protocol", protocol)
 
             if not download_url:
                 return jsonify({"error": "ダウンロードURLを取得できませんでした"}), 400
+
+            # Check if the URL is HLS - warn the client
+            is_hls = protocol in ("m3u8", "m3u8_native") or ".m3u8" in (download_url or "")
 
             title = info.get("title", "video")
             ext = info.get("ext", "mp4")
@@ -52,6 +67,8 @@ def resolve():
                 "ext": ext,
                 "filesize": filesize,
                 "headers": http_headers,
+                "protocol": protocol,
+                "is_hls": is_hls,
             })
     except yt_dlp.utils.DownloadError as e:
         return jsonify({"error": f"動画の取得に失敗: {str(e)}"}), 400

@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir --upgrade yt-dlp
 COPY app.py .
 
 EXPOSE 8000
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:8000", "--timeout", "300", "--workers", "1", "--worker-class", "gthread", "--threads", "8"]
+CMD pip install --no-cache-dir --upgrade --quiet yt-dlp && gunicorn app:app --bind 0.0.0.0:8000 --timeout 300 --workers 1 --worker-class gthread --threads 8

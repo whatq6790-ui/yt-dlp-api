@@ -49,6 +49,7 @@ def resolve():
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "socket_timeout": 30,
     }
 
     try:

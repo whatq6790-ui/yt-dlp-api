@@ -101,7 +101,7 @@ def resolve():
 
 @app.route("/download", methods=["POST"])
 def download_video():
-    """Download video via yt-dlp (handles HLS, DASH, etc.) and stream the file"""
+    """Download video via yt-dlp (handles HLS, DASH, etc.) and return the file"""
     data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
     quality = str(data.get("quality", "1080"))
@@ -109,35 +109,74 @@ def download_video():
     if not url:
         return jsonify({"error": "url is required"}), 400
 
-    cmd = [
-        "python", "-m", "yt_dlp",
-        "--format", f"best[height<={quality}]/best",
-        "--quiet",
-        "--no-warnings",
-        "--noplaylist",
-        "-o", "-",
-        url
-    ]
+    file_id = str(uuid.uuid4())[:8]
+    output_path = os.path.join(TEMP_DIR, f"{file_id}.%(ext)s")
 
-    def generate():
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            while True:
-                chunk = process.stdout.read(65536)
-                if not chunk:
+    ydl_opts = {
+        "format": f"best[height<={quality}]/bestvideo[height<={quality}]+bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "outtmpl": output_path,
+        "merge_output_format": "mp4",
+    }
+
+    try:
+        print(f"[download] Starting download: {url}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+            title = info.get("title", "video")
+            ext = info.get("ext", "mp4")
+
+            # Find the downloaded file
+            final_path = None
+            for candidate in [
+                os.path.join(TEMP_DIR, f"{file_id}.mp4"),
+                os.path.join(TEMP_DIR, f"{file_id}.{ext}"),
+            ]:
+                if os.path.exists(candidate):
+                    final_path = candidate
                     break
-                yield chunk
-        finally:
-            if process.stdout:
-                process.stdout.close()
-            if process.stderr:
-                process.stderr.close()
-            process.terminate()
-            process.wait()
 
-    return Response(generate(), mimetype="video/mp4", headers={
-        "Content-Disposition": "attachment; filename=\"video.mp4\""
-    })
+            if not final_path:
+                for f in os.listdir(TEMP_DIR):
+                    if f.startswith(file_id):
+                        final_path = os.path.join(TEMP_DIR, f)
+                        break
+
+            if not final_path or not os.path.exists(final_path):
+                return jsonify({"error": "ダウンロードしたファイルが見つかりません"}), 500
+
+            file_size = os.path.getsize(final_path)
+            print(f"[download] File ready: {final_path} ({file_size} bytes)")
+
+            if file_size == 0:
+                return jsonify({"error": "ダウンロードしたファイルが空です"}), 500
+
+            response = send_file(
+                final_path,
+                mimetype="video/mp4",
+                as_attachment=True,
+                download_name=f"{title}.mp4",
+            )
+            response.headers["X-Video-Title"] = title
+            response.headers["X-File-Size"] = str(file_size)
+
+            @response.call_on_close
+            def cleanup():
+                try:
+                    if final_path and os.path.exists(final_path):
+                        os.remove(final_path)
+                except Exception:
+                    pass
+
+            return response
+
+    except yt_dlp.utils.DownloadError as e:
+        return jsonify({"error": f"動画の取得に失敗: {str(e)}"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

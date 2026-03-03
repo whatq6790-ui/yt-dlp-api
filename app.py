@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
-import subprocess
 import yt_dlp
 import tempfile
 import os
@@ -14,16 +13,34 @@ CORS(app)
 # Cleanup old temp files periodically
 TEMP_DIR = tempfile.mkdtemp(prefix="ytdlp_")
 
+jobs = {}
+job_lock = threading.Lock()
+
 def cleanup_old_files():
-    """Remove temp files older than 5 minutes"""
+    """Remove temp files older than 10 minutes and old job entries"""
     while True:
         time.sleep(60)
+        now = time.time()
         try:
-            now = time.time()
             for f in os.listdir(TEMP_DIR):
                 fp = os.path.join(TEMP_DIR, f)
-                if os.path.isfile(fp) and now - os.path.getmtime(fp) > 300:
-                    os.remove(fp)
+                if os.path.isfile(fp) and now - os.path.getmtime(fp) > 600:
+                    try:
+                        os.remove(fp)
+                    except:
+                        pass
+        except Exception:
+            pass
+        
+        # Clean jobs older than 10 minutes
+        try:
+            with job_lock:
+                to_delete = []
+                for j_id, j_data in jobs.items():
+                    if now - j_data.get("created_at", now) > 600:
+                        to_delete.append(j_id)
+                for j_id in to_delete:
+                    del jobs[j_id]
         except Exception:
             pass
 
@@ -100,8 +117,8 @@ def resolve():
 
 
 @app.route("/download", methods=["POST"])
-def download_video():
-    """Download video via yt-dlp (handles HLS, DASH, etc.) and return the file"""
+def start_download():
+    """Start video download async and return a job_id"""
     data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
     quality = str(data.get("quality", "1080"))
@@ -109,74 +126,115 @@ def download_video():
     if not url:
         return jsonify({"error": "url is required"}), 400
 
-    file_id = str(uuid.uuid4())[:8]
-    output_path = os.path.join(TEMP_DIR, f"{file_id}.%(ext)s")
+    job_id = str(uuid.uuid4())[:8]
+    with job_lock:
+        jobs[job_id] = {
+            "status": "downloading", 
+            "file": None, 
+            "title": None, 
+            "size": 0, 
+            "error": None,
+            "created_at": time.time()
+        }
 
-    ydl_opts = {
-        "format": f"best[height<={quality}]/bestvideo[height<={quality}]+bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "outtmpl": output_path,
-        "merge_output_format": "mp4",
-    }
+    def bg_download(j_id, d_url, d_qual):
+        output_path = os.path.join(TEMP_DIR, f"{j_id}.%(ext)s")
+        ydl_opts = {
+            "format": f"best[height<={d_qual}]/bestvideo[height<={d_qual}]+bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "outtmpl": output_path,
+            "merge_output_format": "mp4",
+        }
+        try:
+            print(f"[download] Background download started: {j_id}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(d_url, download=True)
+                title = info.get("title", "video")
+                ext = info.get("ext", "mp4")
 
-    try:
-        print(f"[download] Starting download: {url}")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-            title = info.get("title", "video")
-            ext = info.get("ext", "mp4")
-
-            # Find the downloaded file
-            final_path = None
-            for candidate in [
-                os.path.join(TEMP_DIR, f"{file_id}.mp4"),
-                os.path.join(TEMP_DIR, f"{file_id}.{ext}"),
-            ]:
-                if os.path.exists(candidate):
-                    final_path = candidate
-                    break
-
-            if not final_path:
-                for f in os.listdir(TEMP_DIR):
-                    if f.startswith(file_id):
-                        final_path = os.path.join(TEMP_DIR, f)
+                final_path = None
+                for candidate in [
+                    os.path.join(TEMP_DIR, f"{j_id}.mp4"),
+                    os.path.join(TEMP_DIR, f"{j_id}.{ext}"),
+                ]:
+                    if os.path.exists(candidate):
+                        final_path = candidate
                         break
-
-            if not final_path or not os.path.exists(final_path):
-                return jsonify({"error": "ダウンロードしたファイルが見つかりません"}), 500
-
-            file_size = os.path.getsize(final_path)
-            print(f"[download] File ready: {final_path} ({file_size} bytes)")
-
-            if file_size == 0:
-                return jsonify({"error": "ダウンロードしたファイルが空です"}), 500
-
-            response = send_file(
-                final_path,
-                mimetype="video/mp4",
-                as_attachment=True,
-                download_name=f"{title}.mp4",
-            )
-            response.headers["X-Video-Title"] = title
-            response.headers["X-File-Size"] = str(file_size)
-
-            @response.call_on_close
-            def cleanup():
-                try:
+                
+                if not final_path:
+                    for f in os.listdir(TEMP_DIR):
+                        if f.startswith(j_id):
+                            final_path = os.path.join(TEMP_DIR, f)
+                            break
+                            
+                with job_lock:
                     if final_path and os.path.exists(final_path):
-                        os.remove(final_path)
-                except Exception:
-                    pass
+                        fsize = os.path.getsize(final_path)
+                        if fsize > 0:
+                            jobs[j_id]["file"] = final_path
+                            jobs[j_id]["title"] = title
+                            jobs[j_id]["size"] = fsize
+                            jobs[j_id]["status"] = "completed"
+                            print(f"[download] Background download finished: {j_id} - {fsize} bytes")
+                        else:
+                            jobs[j_id]["status"] = "error"
+                            jobs[j_id]["error"] = "Downloaded file is empty (0 bytes)"
+                    else:
+                        jobs[j_id]["status"] = "error"
+                        jobs[j_id]["error"] = "File not found after download"
+        except Exception as e:
+            print(f"[download] Background download error: {j_id}: {str(e)}")
+            with job_lock:
+                jobs[j_id]["status"] = "error"
+                jobs[j_id]["error"] = str(e)
 
-            return response
+    threading.Thread(target=bg_download, args=(job_id, url, quality)).start()
+    return jsonify({"job_id": job_id, "status": "downloading"})
 
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": f"動画の取得に失敗: {str(e)}"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+
+@app.route("/status/<job_id>", methods=["GET"])
+def check_status(job_id):
+    """Check the status of a download job"""
+    with job_lock:
+        job = jobs.get(job_id)
+    
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    
+    return jsonify({
+        "status": job["status"],
+        "error": job["error"],
+        "title": job["title"],
+        "size": job["size"]
+    })
+
+
+@app.route("/file/<job_id>", methods=["GET"])
+def get_file(job_id):
+    """Download the completed file"""
+    with job_lock:
+        job = jobs.get(job_id)
+        
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+        
+    if job["status"] != "completed" or not job["file"]:
+        return jsonify({"error": "File not ready"}), 400
+        
+    if not os.path.exists(job["file"]):
+        return jsonify({"error": "File was deleted"}), 404
+        
+    response = send_file(
+        job["file"],
+        mimetype="video/mp4",
+        as_attachment=True,
+        download_name=f"{job['title']}.mp4",
+    )
+    response.headers["X-Video-Title"] = job["title"]
+    response.headers["X-File-Size"] = str(job["size"])
+    return response
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

@@ -420,7 +420,7 @@ def download_and_upload():
             try:
                 thumb_path = os.path.join(TEMP_DIR, f"{j_id}_thumb.jpg")
                 result = subprocess.run([
-                    "ffmpeg", "-y", "-ss", "5", "-i", final_path,
+                    "ffmpeg", "-y", "-i", final_path, "-ss", "00:00:05.000",
                     "-vframes", "1", "-q:v", "5", "-vf", "scale=480:-1",
                     thumb_path
                 ], capture_output=True, timeout=30)

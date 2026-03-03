@@ -163,6 +163,16 @@ def start_download():
 
     def bg_download(j_id, d_url, d_qual):
         output_path = os.path.join(TEMP_DIR, f"{j_id}.%(ext)s")
+
+        # Use aria2c for parallel segment downloads (significantly faster for HLS)
+        # Falls back to yt-dlp's built-in downloader if aria2c is not available
+        aria2c_available = False
+        try:
+            import shutil
+            aria2c_available = shutil.which("aria2c") is not None
+        except Exception:
+            pass
+
         ydl_opts = {
             "format": f"best[height<={d_qual}]/bestvideo[height<={d_qual}]+bestaudio/best",
             "quiet": True,
@@ -170,7 +180,25 @@ def start_download():
             "noplaylist": True,
             "outtmpl": output_path,
             "merge_output_format": "mp4",
+            "concurrent_fragment_downloads": 16,  # parallel HLS segment downloads
         }
+
+        if aria2c_available:
+            ydl_opts["external_downloader"] = "aria2c"
+            ydl_opts["external_downloader_args"] = {
+                "aria2c": [
+                    "--max-connection-per-server=16",
+                    "--split=16",
+                    "--min-split-size=1M",
+                    "--max-concurrent-downloads=16",
+                    "--file-allocation=none",
+                    "--quiet=true",
+                ]
+            }
+            print(f"[download] Using aria2c for parallel downloads: {j_id}")
+        else:
+            print(f"[download] aria2c not found, using yt-dlp built-in downloader: {j_id}")
+
         try:
             print(f"[download] Background download started: {j_id}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:

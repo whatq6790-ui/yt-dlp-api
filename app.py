@@ -8,6 +8,9 @@ import threading
 import time
 import subprocess
 import sys
+import shutil
+import base64
+import requests as req_lib
 
 app = Flask(__name__)
 CORS(app)
@@ -248,7 +251,7 @@ def start_download():
 
 @app.route("/status/<job_id>", methods=["GET"])
 def check_status(job_id):
-    """Check the status of a download job"""
+    """Check the status of a download/upload job"""
     with job_lock:
         job = jobs.get(job_id)
     
@@ -259,7 +262,11 @@ def check_status(job_id):
         "status": job["status"],
         "error": job["error"],
         "title": job["title"],
-        "size": job["size"]
+        "size": job["size"],
+        "phase": job.get("phase", ""),
+        "downloaded": job.get("downloaded", 0),
+        "total": job.get("total", 0),
+        "thumbnail": job.get("thumbnail"),  # base64 jpeg for server-side upload flow
     })
 
 
@@ -307,6 +314,167 @@ def get_file(job_id):
             "Access-Control-Expose-Headers": "X-Video-Title, X-File-Size, Content-Disposition"
         }
     )
+
+
+@app.route("/download-and-upload", methods=["POST"])
+def download_and_upload():
+    """Download video and upload directly to HStorage (bypasses browser for max speed)"""
+    data = request.get_json(silent=True) or {}
+    url = data.get("url", "").strip()
+    upload_url = data.get("upload_url", "").strip()  # presigned PUT URL for HStorage
+    quality = str(data.get("quality", "1080"))
+
+    if not url or not upload_url:
+        return jsonify({"error": "url and upload_url are required"}), 400
+
+    job_id = str(uuid.uuid4())[:8]
+    with job_lock:
+        jobs[job_id] = {
+            "status": "downloading",
+            "file": None,
+            "title": None,
+            "size": 0,
+            "error": None,
+            "phase": "starting",
+            "downloaded": 0,
+            "total": 0,
+            "thumbnail": None,
+            "created_at": time.time()
+        }
+
+    def bg_task(j_id, d_url, d_qual, up_url):
+        output_path = os.path.join(TEMP_DIR, f"{j_id}.%(ext)s")
+
+        aria2c_available = shutil.which("aria2c") is not None
+
+        def progress_hook(d):
+            if d["status"] == "downloading":
+                downloaded = d.get("downloaded_bytes", 0)
+                total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+                with job_lock:
+                    jobs[j_id]["downloaded"] = downloaded
+                    jobs[j_id]["total"] = total
+                    jobs[j_id]["phase"] = "downloading"
+            elif d["status"] == "finished":
+                with job_lock:
+                    jobs[j_id]["phase"] = "merging"
+
+        ydl_opts = {
+            "format": f"best[height<={d_qual}]/bestvideo[height<={d_qual}]+bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "outtmpl": output_path,
+            "merge_output_format": "mp4",
+            "concurrent_fragment_downloads": 16,
+            "progress_hooks": [progress_hook],
+        }
+
+        if aria2c_available:
+            ydl_opts["external_downloader"] = "aria2c"
+            ydl_opts["external_downloader_args"] = {
+                "aria2c": [
+                    "--max-connection-per-server=16",
+                    "--split=16",
+                    "--min-split-size=1M",
+                    "--file-allocation=none",
+                    "--quiet=true",
+                ]
+            }
+
+        try:
+            print(f"[dlup] Download started: {j_id}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(d_url, download=True)
+                title = info.get("title", "video")
+                ext = info.get("ext", "mp4")
+
+            # Find the output file
+            final_path = None
+            for candidate in [
+                os.path.join(TEMP_DIR, f"{j_id}.mp4"),
+                os.path.join(TEMP_DIR, f"{j_id}.{ext}"),
+            ]:
+                if os.path.exists(candidate):
+                    final_path = candidate
+                    break
+            if not final_path:
+                for f in os.listdir(TEMP_DIR):
+                    if f.startswith(j_id) and not f.endswith("_thumb.jpg"):
+                        final_path = os.path.join(TEMP_DIR, f)
+                        break
+
+            if not final_path or not os.path.exists(final_path):
+                raise Exception("File not found after download")
+            if os.path.getsize(final_path) == 0:
+                raise Exception("Downloaded file is empty (0 bytes)")
+
+            file_size = os.path.getsize(final_path)
+            print(f"[dlup] Downloaded {file_size} bytes: {j_id}")
+
+            # Extract thumbnail at 5s using ffmpeg
+            with job_lock:
+                jobs[j_id]["phase"] = "thumbnail"
+            thumbnail_b64 = None
+            try:
+                thumb_path = os.path.join(TEMP_DIR, f"{j_id}_thumb.jpg")
+                result = subprocess.run([
+                    "ffmpeg", "-y", "-ss", "5", "-i", final_path,
+                    "-vframes", "1", "-q:v", "5", "-vf", "scale=480:-1",
+                    thumb_path
+                ], capture_output=True, timeout=30)
+                if result.returncode == 0 and os.path.exists(thumb_path):
+                    with open(thumb_path, "rb") as tf:
+                        thumbnail_b64 = "data:image/jpeg;base64," + base64.b64encode(tf.read()).decode()
+                    os.remove(thumb_path)
+                    print(f"[dlup] Thumbnail extracted: {j_id}")
+            except Exception as te:
+                print(f"[dlup] Thumbnail error: {te}")
+
+            # Upload directly to HStorage via presigned PUT URL
+            with job_lock:
+                jobs[j_id]["phase"] = "uploading"
+                jobs[j_id]["status"] = "uploading"
+                jobs[j_id]["title"] = title
+
+            print(f"[dlup] Uploading to HStorage: {j_id} ({file_size} bytes)")
+            with open(final_path, "rb") as f:
+                upload_resp = req_lib.put(
+                    up_url,
+                    data=f,
+                    headers={
+                        "Content-Type": "video/mp4",
+                        "Content-Length": str(file_size),
+                    },
+                    timeout=1800,  # 30 min max
+                    stream=True,
+                )
+
+            if upload_resp.ok:
+                with job_lock:
+                    jobs[j_id]["status"] = "completed"
+                    jobs[j_id]["size"] = file_size
+                    jobs[j_id]["thumbnail"] = thumbnail_b64
+                    jobs[j_id]["phase"] = "done"
+                print(f"[dlup] Upload completed: {j_id}")
+            else:
+                raise Exception(f"HStorage upload failed: {upload_resp.status_code} {upload_resp.text[:200]}")
+
+            # Cleanup temp file
+            try:
+                os.remove(final_path)
+            except Exception:
+                pass
+
+        except Exception as e:
+            print(f"[dlup] Error: {j_id}: {str(e)}")
+            with job_lock:
+                jobs[j_id]["status"] = "error"
+                jobs[j_id]["error"] = str(e)
+
+    threading.Thread(target=bg_task, args=(job_id, url, quality, upload_url)).start()
+    return jsonify({"job_id": job_id, "status": "downloading"})
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

@@ -6,6 +6,8 @@ import os
 import uuid
 import threading
 import time
+import subprocess
+import sys
 
 app = Flask(__name__)
 CORS(app)
@@ -15,6 +17,24 @@ TEMP_DIR = tempfile.mkdtemp(prefix="ytdlp_")
 
 jobs = {}
 job_lock = threading.Lock()
+
+def auto_update_ytdlp():
+    """Update yt-dlp to latest version in the background on startup"""
+    try:
+        print("[startup] Updating yt-dlp to latest version...")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            print("[startup] yt-dlp updated successfully")
+        else:
+            print(f"[startup] yt-dlp update failed: {result.stderr}")
+    except Exception as e:
+        print(f"[startup] yt-dlp auto-update error: {e}")
+
+# Start yt-dlp auto-update in background
+threading.Thread(target=auto_update_ytdlp, daemon=True).start()
 
 def cleanup_old_files():
     """Remove temp files older than 10 minutes and old job entries"""
@@ -50,7 +70,11 @@ cleanup_thread.start()
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "yt-dlp-api"})
+    try:
+        ytdlp_version = yt_dlp.version.__version__
+    except Exception:
+        ytdlp_version = "unknown"
+    return jsonify({"status": "ok", "service": "yt-dlp-api", "yt_dlp_version": ytdlp_version})
 
 
 @app.route("/resolve", methods=["POST"])

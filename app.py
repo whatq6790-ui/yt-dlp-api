@@ -215,7 +215,7 @@ import urllib.parse
 
 @app.route("/file/<job_id>", methods=["GET"])
 def get_file(job_id):
-    """Download the completed file via streaming"""
+    """Download the completed file via safe streaming"""
     with job_lock:
         job = jobs.get(job_id)
         
@@ -231,22 +231,30 @@ def get_file(job_id):
 
     file_size = os.path.getsize(filepath)
     title = job.get("title", "video")
-
     safe_title = urllib.parse.quote(title)
 
-    response = send_file(
-        filepath,
+    def stream_file():
+        try:
+            with open(filepath, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        except Exception as e:
+            print(f"Stream error: {e}")
+
+    return Response(
+        stream_file(),
         mimetype="video/mp4",
-        as_attachment=True,
-        download_name=f"{title}.mp4",
+        headers={
+            "Content-Disposition": 'attachment; filename="video.mp4"',
+            "Content-Length": str(file_size),
+            "X-Video-Title": safe_title,
+            "X-File-Size": str(file_size),
+            "Access-Control-Expose-Headers": "X-Video-Title, X-File-Size, Content-Disposition"
+        }
     )
-    
-    # HTTP headers must be ASCII, so we encode the title
-    response.headers["X-Video-Title"] = safe_title
-    response.headers["X-File-Size"] = str(file_size)
-    response.headers["Access-Control-Expose-Headers"] = "X-Video-Title, X-File-Size, Content-Disposition"
-    
-    return response
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

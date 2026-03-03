@@ -9,4 +9,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 
 EXPOSE 8000
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:8000", "--timeout", "300", "--workers", "2", "--worker-class", "gthread", "--threads", "4"]
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:8000", "--timeout", "300", "--workers", "1", "--worker-class", "gthread", "--threads", "8"]

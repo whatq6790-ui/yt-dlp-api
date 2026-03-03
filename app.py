@@ -213,7 +213,7 @@ def check_status(job_id):
 
 @app.route("/file/<job_id>", methods=["GET"])
 def get_file(job_id):
-    """Download the completed file"""
+    """Download the completed file via streaming"""
     with job_lock:
         job = jobs.get(job_id)
         
@@ -223,18 +223,31 @@ def get_file(job_id):
     if job["status"] != "completed" or not job["file"]:
         return jsonify({"error": "File not ready"}), 400
         
-    if not os.path.exists(job["file"]):
+    filepath = job["file"]
+    if not os.path.exists(filepath):
         return jsonify({"error": "File was deleted"}), 404
-        
-    response = send_file(
-        job["file"],
+
+    file_size = os.path.getsize(filepath)
+    title = job.get("title", "video")
+
+    def stream_file():
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+
+    return Response(
+        stream_file(),
         mimetype="video/mp4",
-        as_attachment=True,
-        download_name=f"{job['title']}.mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="{title}.mp4"',
+            "Content-Length": str(file_size),
+            "X-Video-Title": title,
+            "X-File-Size": str(file_size),
+        }
     )
-    response.headers["X-Video-Title"] = job["title"]
-    response.headers["X-File-Size"] = str(job["size"])
-    return response
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

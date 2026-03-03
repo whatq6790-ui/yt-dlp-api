@@ -300,6 +300,23 @@ def get_file(job_id):
     )
 
 
+@app.route("/provide-url/<job_id>", methods=["POST"])
+def provide_url(job_id):
+    """Provide the upload URL for a job that is waiting for it"""
+    data = request.get_json(silent=True) or {}
+    upload_url = data.get("upload_url", "").strip()
+    
+    if not upload_url:
+        return jsonify({"error": "upload_url is required"}), 400
+        
+    with job_lock:
+        if job_id not in jobs:
+            return jsonify({"error": "Job not found"}), 404
+        jobs[job_id]["upload_url"] = upload_url
+        
+    return jsonify({"status": "ok"})
+
+
 @app.route("/download-and-upload", methods=["POST"])
 def download_and_upload():
     """Download video and upload directly to HStorage (bypasses browser for max speed)"""
@@ -308,8 +325,8 @@ def download_and_upload():
     upload_url = data.get("upload_url", "").strip()  # presigned PUT URL for HStorage
     quality = str(data.get("quality", "1080"))
 
-    if not url or not upload_url:
-        return jsonify({"error": "url and upload_url are required"}), 400
+    if not url:
+        return jsonify({"error": "url is required"}), 400
 
     job_id = str(uuid.uuid4())[:8]
     with job_lock:
@@ -414,6 +431,23 @@ def download_and_upload():
                     print(f"[dlup] Thumbnail extracted: {j_id}")
             except Exception as te:
                 print(f"[dlup] Thumbnail error: {te}")
+
+            if not up_url:
+                with job_lock:
+                    jobs[j_id]["phase"] = "waiting_for_url"
+                
+                print(f"[dlup] Waiting for upload URL: {j_id}")
+                wait_time = 0
+                while wait_time < 3600:  # wait up to 1 hour
+                    with job_lock:
+                        up_url = jobs[j_id].get("upload_url")
+                    if up_url:
+                        break
+                    time.sleep(2)
+                    wait_time += 2
+                
+                if not up_url:
+                    raise Exception("Timed out waiting for upload URL")
 
             # Upload directly to HStorage via presigned PUT URL
             with job_lock:

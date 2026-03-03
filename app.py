@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 import yt_dlp
 import tempfile
 import os
@@ -7,6 +8,7 @@ import threading
 import time
 
 app = Flask(__name__)
+CORS(app)
 
 # Cleanup old temp files periodically
 TEMP_DIR = tempfile.mkdtemp(prefix="ytdlp_")

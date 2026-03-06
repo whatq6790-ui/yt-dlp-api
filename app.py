@@ -462,29 +462,40 @@ def download_and_upload():
 
             print(f"[dlup] Uploading to HStorage: {j_id} ({file_size} bytes)")
 
-            def upload_generator(filepath, job_id, total_size):
-                """Stream file in chunks and track upload progress"""
-                uploaded = 0
-                chunk_size = 1024 * 1024  # 1MB chunks
-                with open(filepath, "rb") as fh:
-                    while True:
-                        chunk = fh.read(chunk_size)
-                        if not chunk:
-                            break
-                        uploaded += len(chunk)
-                        with job_lock:
-                            jobs[job_id]["uploaded"] = uploaded
-                        yield chunk
+            class ProgressFile:
+                """File wrapper that tracks read progress for upload"""
+                def __init__(self, filepath, job_id):
+                    self._file = open(filepath, "rb")
+                    self._job_id = job_id
+                    self._uploaded = 0
 
-            upload_resp = req_lib.put(
+                def read(self, size=-1):
+                    chunk = self._file.read(size)
+                    if chunk:
+                        self._uploaded += len(chunk)
+                        with job_lock:
+                            jobs[self._job_id]["uploaded"] = self._uploaded
+                    return chunk
+
+                def __len__(self):
+                    return file_size
+
+                def close(self):
+                    self._file.close()
+
+            pf = ProgressFile(final_path, j_id)
+            try:
+                upload_resp = req_lib.put(
                     up_url,
-                    data=upload_generator(final_path, j_id, file_size),
+                    data=pf,
                     headers={
                         "Content-Type": "video/mp4",
                         "Content-Length": str(file_size),
                     },
                     timeout=1800,  # 30 min max
                 )
+            finally:
+                pf.close()
 
             if upload_resp.ok:
                 with job_lock:

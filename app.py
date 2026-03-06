@@ -416,26 +416,67 @@ def download_and_upload():
             file_size = os.path.getsize(final_path)
             print(f"[dlup] Downloaded {file_size} bytes: {j_id}")
 
-            # Extract thumbnail using ffmpeg (input seeking: -ss before -i for speed & reliability)
+            # Extract thumbnail using ffmpeg select filter for guaranteed accuracy
             with job_lock:
                 jobs[j_id]["phase"] = "thumbnail"
             thumbnail_b64 = None
             try:
                 thumb_path = os.path.join(TEMP_DIR, f"{j_id}_thumb.webp")
-                ss_time = f"00:00:{thumb_time:02d}.000"
+                thumb_png = os.path.join(TEMP_DIR, f"{j_id}_thumb.png")
+
+                # Step 1: Extract frame at exactly thumb_time seconds using select filter
+                # select filter guarantees frame-accurate extraction regardless of keyframes
+                select_expr = f"gte(t\\,{thumb_time})"
                 result = subprocess.run([
                     "ffmpeg", "-y", "-i", final_path,
-                    "-ss", ss_time, "-vframes", "1", "-vf", "scale=480:-1",
-                    "-c:v", "libwebp", "-quality", "80",
-                    thumb_path
-                ], capture_output=True, timeout=60)
-                if result.returncode == 0 and os.path.exists(thumb_path):
-                    with open(thumb_path, "rb") as tf:
-                        thumbnail_b64 = "data:image/webp;base64," + base64.b64encode(tf.read()).decode()
+                    "-vf", f"select={select_expr},scale=480:-1",
+                    "-frames:v", "1",
+                    "-vsync", "vfr",
+                    thumb_png
+                ], capture_output=True, timeout=120)
+
+                if result.returncode != 0 or not os.path.exists(thumb_png):
+                    # Fallback: try simple output seeking with PNG
+                    subprocess.run([
+                        "ffmpeg", "-y", "-i", final_path,
+                        "-ss", str(thumb_time), "-frames:v", "1",
+                        "-vf", "scale=480:-1",
+                        thumb_png
+                    ], capture_output=True, timeout=120)
+
+                if os.path.exists(thumb_png):
+                    # Step 2: Convert PNG to WebP
+                    result2 = subprocess.run([
+                        "ffmpeg", "-y", "-i", thumb_png,
+                        "-c:v", "libwebp", "-quality", "80",
+                        thumb_path
+                    ], capture_output=True, timeout=30)
+
+                    if result2.returncode != 0 or not os.path.exists(thumb_path):
+                        # libwebp not available, use PNG as fallback
+                        thumb_path = thumb_png
+                        with open(thumb_path, "rb") as tf:
+                            thumbnail_b64 = "data:image/png;base64," + base64.b64encode(tf.read()).decode()
+                    else:
+                        with open(thumb_path, "rb") as tf:
+                            thumbnail_b64 = "data:image/webp;base64," + base64.b64encode(tf.read()).decode()
+                        try:
+                            os.remove(thumb_png)
+                        except Exception:
+                            pass
+
                     os.remove(thumb_path)
-                    print(f"[dlup] Thumbnail extracted (webp): {j_id}")
+                    print(f"[dlup] Thumbnail extracted at {thumb_time}s: {j_id}")
             except Exception as te:
                 print(f"[dlup] Thumbnail error: {te}")
+            finally:
+                # Clean up temp files
+                for tmp in [thumb_png, thumb_path]:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except Exception:
+                        pass
 
             if not up_url:
                 with job_lock:

@@ -324,6 +324,7 @@ def download_and_upload():
     url = data.get("url", "").strip()
     upload_url = data.get("upload_url", "").strip()  # presigned PUT URL for HStorage
     quality = str(data.get("quality", "1080"))
+    thumbnail_time = int(data.get("thumbnail_time", 5))  # seconds to capture thumbnail at
 
     if not url:
         return jsonify({"error": "url is required"}), 400
@@ -343,7 +344,7 @@ def download_and_upload():
             "created_at": time.time()
         }
 
-    def bg_task(j_id, d_url, d_qual, up_url):
+    def bg_task(j_id, d_url, d_qual, up_url, thumb_time):
         output_path = os.path.join(TEMP_DIR, f"{j_id}.%(ext)s")
 
         aria2c_available = shutil.which("aria2c") is not None
@@ -413,14 +414,15 @@ def download_and_upload():
             file_size = os.path.getsize(final_path)
             print(f"[dlup] Downloaded {file_size} bytes: {j_id}")
 
-            # Extract thumbnail at 5s using ffmpeg
+            # Extract thumbnail using ffmpeg (input seeking: -ss before -i for speed & reliability)
             with job_lock:
                 jobs[j_id]["phase"] = "thumbnail"
             thumbnail_b64 = None
             try:
                 thumb_path = os.path.join(TEMP_DIR, f"{j_id}_thumb.jpg")
+                ss_time = f"00:00:{thumb_time:02d}.000"
                 result = subprocess.run([
-                    "ffmpeg", "-y", "-i", final_path, "-ss", "00:00:05.000",
+                    "ffmpeg", "-y", "-ss", ss_time, "-i", final_path,
                     "-vframes", "1", "-q:v", "5", "-vf", "scale=480:-1",
                     thumb_path
                 ], capture_output=True, timeout=30)
@@ -490,7 +492,7 @@ def download_and_upload():
                 jobs[j_id]["status"] = "error"
                 jobs[j_id]["error"] = str(e)
 
-    threading.Thread(target=bg_task, args=(job_id, url, quality, upload_url)).start()
+    threading.Thread(target=bg_task, args=(job_id, url, quality, upload_url, thumbnail_time)).start()
     return jsonify({"job_id": job_id, "status": "downloading"})
 
 

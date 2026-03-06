@@ -424,11 +424,11 @@ def download_and_upload():
                 thumb_path = os.path.join(TEMP_DIR, f"{j_id}_thumb.webp")
                 ss_time = f"00:00:{thumb_time:02d}.000"
                 result = subprocess.run([
-                    "ffmpeg", "-y", "-ss", ss_time, "-i", final_path,
-                    "-vframes", "1", "-vf", "scale=480:-1",
+                    "ffmpeg", "-y", "-i", final_path,
+                    "-ss", ss_time, "-vframes", "1", "-vf", "scale=480:-1",
                     "-c:v", "libwebp", "-quality", "80",
                     thumb_path
-                ], capture_output=True, timeout=30)
+                ], capture_output=True, timeout=60)
                 if result.returncode == 0 and os.path.exists(thumb_path):
                     with open(thumb_path, "rb") as tf:
                         thumbnail_b64 = "data:image/webp;base64," + base64.b64encode(tf.read()).decode()

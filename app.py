@@ -250,7 +250,8 @@ def check_status(job_id):
         "phase": job.get("phase", ""),
         "downloaded": job.get("downloaded", 0),
         "total": job.get("total", 0),
-        "thumbnail": job.get("thumbnail"),  # base64 jpeg for server-side upload flow
+        "uploaded": job.get("uploaded", 0),
+        "thumbnail": job.get("thumbnail"),  # base64 webp for server-side upload flow
     })
 
 
@@ -340,6 +341,7 @@ def download_and_upload():
             "phase": "starting",
             "downloaded": 0,
             "total": 0,
+            "uploaded": 0,
             "thumbnail": None,
             "created_at": time.time()
         }
@@ -402,7 +404,7 @@ def download_and_upload():
                     break
             if not final_path:
                 for f in os.listdir(TEMP_DIR):
-                    if f.startswith(j_id) and not f.endswith("_thumb.jpg"):
+                    if f.startswith(j_id) and not f.endswith("_thumb.webp") and not f.endswith("_thumb.jpg"):
                         final_path = os.path.join(TEMP_DIR, f)
                         break
 
@@ -419,18 +421,19 @@ def download_and_upload():
                 jobs[j_id]["phase"] = "thumbnail"
             thumbnail_b64 = None
             try:
-                thumb_path = os.path.join(TEMP_DIR, f"{j_id}_thumb.jpg")
+                thumb_path = os.path.join(TEMP_DIR, f"{j_id}_thumb.webp")
                 ss_time = f"00:00:{thumb_time:02d}.000"
                 result = subprocess.run([
                     "ffmpeg", "-y", "-ss", ss_time, "-i", final_path,
-                    "-vframes", "1", "-q:v", "5", "-vf", "scale=480:-1",
+                    "-vframes", "1", "-vf", "scale=480:-1",
+                    "-c:v", "libwebp", "-quality", "80",
                     thumb_path
                 ], capture_output=True, timeout=30)
                 if result.returncode == 0 and os.path.exists(thumb_path):
                     with open(thumb_path, "rb") as tf:
-                        thumbnail_b64 = "data:image/jpeg;base64," + base64.b64encode(tf.read()).decode()
+                        thumbnail_b64 = "data:image/webp;base64," + base64.b64encode(tf.read()).decode()
                     os.remove(thumb_path)
-                    print(f"[dlup] Thumbnail extracted: {j_id}")
+                    print(f"[dlup] Thumbnail extracted (webp): {j_id}")
             except Exception as te:
                 print(f"[dlup] Thumbnail error: {te}")
 
@@ -458,16 +461,29 @@ def download_and_upload():
                 jobs[j_id]["title"] = title
 
             print(f"[dlup] Uploading to HStorage: {j_id} ({file_size} bytes)")
-            with open(final_path, "rb") as f:
-                upload_resp = req_lib.put(
+
+            def upload_generator(filepath, job_id, total_size):
+                """Stream file in chunks and track upload progress"""
+                uploaded = 0
+                chunk_size = 1024 * 1024  # 1MB chunks
+                with open(filepath, "rb") as fh:
+                    while True:
+                        chunk = fh.read(chunk_size)
+                        if not chunk:
+                            break
+                        uploaded += len(chunk)
+                        with job_lock:
+                            jobs[job_id]["uploaded"] = uploaded
+                        yield chunk
+
+            upload_resp = req_lib.put(
                     up_url,
-                    data=f,
+                    data=upload_generator(final_path, j_id, file_size),
                     headers={
                         "Content-Type": "video/mp4",
                         "Content-Length": str(file_size),
                     },
                     timeout=1800,  # 30 min max
-                    stream=True,
                 )
 
             if upload_resp.ok:
